@@ -1,0 +1,785 @@
+#!/usr/bin/env python3
+"""
+fetch_and_build.py
+------------------
+每天由 GitHub Actions 執行：
+1. 從 NewsAPI 抓取各地區即時新聞
+2. 將資料注入 HTML 模板
+3. 輸出到 docs/ 供 GitHub Pages 部署
+"""
+
+import os
+import json
+import requests
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from jinja2 import Template
+
+# ── 設定 ──────────────────────────────────────────
+API_KEY   = os.environ.get("NEWS_API_KEY", "")
+BASE_URL  = "https://newsapi.org/v2/top-headlines"
+EVERY_URL = "https://newsapi.org/v2/everything"
+DOCS_DIR  = Path(__file__).parent.parent / "docs"
+TW_TZ     = timezone(timedelta(hours=8))
+
+REGION_QUERIES = [
+    {"id": "asia",     "label": "亞太",     "chip": "chip-asia",     "q": "Asia OR Taiwan OR Japan OR Korea OR China", "lang": "en"},
+    {"id": "europe",   "label": "歐美",     "chip": "chip-europe",   "q": "Europe OR EU OR UK OR Germany OR France",   "lang": "en"},
+    {"id": "americas", "label": "美洲",     "chip": "chip-americas", "q": "United States OR America OR Canada OR Brazil", "lang": "en"},
+    {"id": "mideast",  "label": "中東",     "chip": "chip-mideast",  "q": "Middle East OR Israel OR Iran OR Gaza OR Saudi", "lang": "en"},
+    {"id": "africa",   "label": "非洲",     "chip": "chip-africa",   "q": "Africa OR Nigeria OR South Africa OR Kenya", "lang": "en"},
+]
+
+CATEGORY_SOURCES = [
+    {"id": "breaking", "label": "今日焦點", "category": "general", "country": "us"},
+    {"id": "tech",     "label": "科技",     "category": "technology","country": "us"},
+    {"id": "finance",  "label": "財經",     "category": "business",  "country": "us"},
+]
+
+# ── 工具函式 ──────────────────────────────────────
+def fetch_top(category="general", country="us", page_size=6):
+    """抓取分類頭條新聞"""
+    if not API_KEY:
+        return []
+    try:
+        r = requests.get(BASE_URL, params={
+            "apiKey": API_KEY,
+            "category": category,
+            "country": country,
+            "pageSize": page_size,
+            "language": "en",
+        }, timeout=15)
+        data = r.json()
+        return data.get("articles", [])
+    except Exception as e:
+        print(f"[WARN] fetch_top({category}) 失敗: {e}")
+        return []
+
+def fetch_region(query, lang="en", page_size=5):
+    """抓取地區關鍵字新聞"""
+    if not API_KEY:
+        return []
+    try:
+        r = requests.get(EVERY_URL, params={
+            "apiKey": API_KEY,
+            "q": query,
+            "language": lang,
+            "sortBy": "publishedAt",
+            "pageSize": page_size,
+        }, timeout=15)
+        data = r.json()
+        return data.get("articles", [])
+    except Exception as e:
+        print(f"[WARN] fetch_region({query[:20]}) 失敗: {e}")
+        return []
+
+def clean_article(art, region_id="global", region_label="全球"):
+    """將 NewsAPI article 轉為網頁所需格式"""
+    title   = (art.get("title")       or "").replace("[Removed]", "").strip()
+    summary = (art.get("description") or art.get("content") or "").replace("[Removed]", "").strip()
+    if not title or title == "[Removed]":
+        return None
+
+    # 截斷過長摘要
+    if len(summary) > 200:
+        summary = summary[:197] + "…"
+
+    # 圖片：若無則用 Unsplash 隨機主題圖
+    FALLBACK_IMAGES = {
+        "asia":     "https://images.unsplash.com/photo-1480796927426-f609979314bd?w=900&q=75",
+        "europe":   "https://images.unsplash.com/photo-1467269204594-9661b134dd2b?w=900&q=75",
+        "americas": "https://images.unsplash.com/photo-1490644658840-3f2e3f8c5625?w=900&q=75",
+        "mideast":  "https://images.unsplash.com/photo-1564419320461-6870880221ad?w=900&q=75",
+        "africa":   "https://images.unsplash.com/photo-1547471080-7cc2caa01a7e?w=900&q=75",
+        "global":   "https://images.unsplash.com/photo-1529107386315-e1a2ed48a620?w=900&q=75",
+        "tech":     "https://images.unsplash.com/photo-1677442135703-1787eea5ce01?w=900&q=75",
+        "finance":  "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?w=900&q=75",
+    }
+    image = art.get("urlToImage") or FALLBACK_IMAGES.get(region_id, FALLBACK_IMAGES["global"])
+
+    # 來源名稱
+    source = (art.get("source") or {}).get("name") or "國際媒體"
+
+    # 時間
+    pub = art.get("publishedAt") or datetime.now(TW_TZ).isoformat()
+
+    # 產生穩定 id
+    slug = title[:40].lower()
+    for ch in " .,!?:;/\\\"'":
+        slug = slug.replace(ch, "-")
+    art_id = f"{region_id}-{slug[:32]}"
+
+    return {
+        "id":          art_id,
+        "title":       title,
+        "summary":     summary or "點擊閱讀完整報導。",
+        "country":     region_label,
+        "region":      region_id,
+        "category":    region_label,
+        "author":      source,
+        "publishedAt": pub,
+        "readingTime": max(2, len(summary) // 200 + 2),
+        "imageUrl":    image,
+        "imageAlt":    title[:40],
+        "breaking":    False,
+        "tags":        [region_label, source],
+        "url":         art.get("url") or "#",
+        "content":     f"<p>{summary}</p><p><a href='{art.get('url','#')}' target='_blank' style='color:var(--red);font-weight:600'>前往原文來源閱讀完整報導 →</a></p>",
+    }
+
+# ── 主流程 ────────────────────────────────────────
+def main():
+    now_tw = datetime.now(TW_TZ)
+    print(f"🕐 開始抓取新聞... {now_tw.strftime('%Y-%m-%d %H:%M')} (台灣時間)")
+
+    all_articles = []
+
+    # 1. 今日焦點（美國頭條）
+    breaking = fetch_top("general", "us", 8)
+    for i, a in enumerate(breaking):
+        art = clean_article(a, "global", "國際")
+        if art:
+            art["breaking"] = (i < 3)
+            all_articles.append(art)
+
+    # 2. 各地區
+    for reg in REGION_QUERIES:
+        arts = fetch_region(reg["q"], page_size=5)
+        for a in arts:
+            art = clean_article(a, reg["id"], reg["label"])
+            if art:
+                all_articles.append(art)
+
+    # 3. 科技 & 財經
+    for cat in [("technology","tech","科技"), ("business","finance","財經")]:
+        arts = fetch_top(cat[0], "us", 4)
+        for a in arts:
+            art = clean_article(a, cat[1], cat[2])
+            if art:
+                all_articles.append(art)
+
+    # 去重（以標題前30字為 key）
+    seen = set()
+    unique = []
+    for a in all_articles:
+        key = a["title"][:30]
+        if key not in seen:
+            seen.add(key)
+            unique.append(a)
+
+    # 若 API Key 未設定，保留示範資料
+    if not API_KEY or len(unique) < 3:
+        print("⚠️  未設定 NEWS_API_KEY 或結果為空，使用內建示範資料")
+        unique = get_fallback_data()
+
+    # 確保至少有12篇
+    while len(unique) < 12:
+        unique.extend(unique[:12 - len(unique)])
+
+    print(f"✅ 共抓到 {len(unique)} 篇新聞（去重後）")
+
+    # 輸出 JSON（供除錯）
+    DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(DOCS_DIR / "news_data.json", "w", encoding="utf-8") as f:
+        json.dump({"updatedAt": now_tw.isoformat(), "articles": unique[:30]}, f, ensure_ascii=False, indent=2)
+
+    # 生成 HTML
+    build_html(unique[:30], now_tw)
+    print(f"🎉 完成！網頁已輸出至 docs/index.html")
+
+# ── HTML 建構 ─────────────────────────────────────
+def build_html(articles, now_tw):
+    articles_json = json.dumps(articles, ensure_ascii=False)
+    date_str = now_tw.strftime("%Y年%m月%d日")
+    time_str = now_tw.strftime("%H:%M")
+    updated_str = now_tw.strftime("%Y-%m-%d %H:%M")
+
+    html = HTML_TEMPLATE.replace("%%ARTICLES_JSON%%", articles_json)
+    html = html.replace("%%DATE%%", date_str)
+    html = html.replace("%%TIME%%", time_str)
+    html = html.replace("%%UPDATED%%", updated_str)
+
+    with open(DOCS_DIR / "index.html", "w", encoding="utf-8") as f:
+        f.write(html)
+
+# ── 備用示範資料（API Key 未設時使用）────────────
+def get_fallback_data():
+    return [
+        {"id":"demo-1","title":"川普與習近平於北京人民大會堂展開歷史性峰會","summary":"美中兩國領導人就貿易、台灣、伊朗及人工智慧等議題展開高峰會談，馬斯克、黃仁勳等企業巨頭隨行。","country":"中國","region":"asia","category":"外交","author":"Reuters","publishedAt":"2026-05-14T06:00:00+08:00","readingTime":6,"imageUrl":"https://images.unsplash.com/photo-1529107386315-e1a2ed48a620?w=900&q=75","imageAlt":"川習峰會","breaking":True,"tags":["川普","習近平","美中關係"],"url":"#","content":"<p>川普與習近平於北京人民大會堂展開歷史性峰會，議題涵蓋貿易、台灣、伊朗及人工智慧。</p>"},
+        {"id":"demo-2","title":"習近平警告川普：台灣問題若處理不當將釀嚴重危機","summary":"中國國家主席習近平在峰會中明確表示，台灣是中美關係最重要的議題，若處置失當將使雙邊關係陷入極度危險境地。","country":"中國","region":"asia","category":"安全","author":"NBC News","publishedAt":"2026-05-14T04:00:00+08:00","readingTime":5,"imageUrl":"https://images.unsplash.com/photo-1601134467661-3d775b999c8b?w=900&q=75","imageAlt":"台灣議題","breaking":True,"tags":["台灣","習近平","川普"],"url":"#","content":"<p>習近平警告，台灣問題若處理不當將造成「碰撞甚至衝突」。</p>"},
+        {"id":"demo-3","title":"俄羅斯在川習峰會期間對基輔發動空襲","summary":"就在川普與習近平於北京進行會談之際，俄羅斯對烏克蘭首都基輔發動大規模空襲，烏克蘭外長強烈譴責此一「野蠻攻擊」。","country":"烏克蘭","region":"europe","category":"衝突","author":"AP","publishedAt":"2026-05-14T03:30:00+08:00","readingTime":4,"imageUrl":"https://images.unsplash.com/photo-1467269204594-9661b134dd2b?w=900&q=75","imageAlt":"基輔","breaking":True,"tags":["烏克蘭","俄羅斯","戰爭"],"url":"#","content":"<p>俄羅斯對烏克蘭首都基輔發動大規模空襲，烏克蘭外長強烈譴責。</p>"},
+    ]
+
+# ══════════════════════════════════════════════════
+# HTML 模板（單檔，全功能）
+# ══════════════════════════════════════════════════
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>環球快報 WorldPulse — %%DATE%% 即時國際新聞</title>
+<meta name="description" content="%%DATE%% 最新國際新聞，自動每日更新">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Noto+Sans+TC:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--red:#C0392B;--red-dark:#96281B;--navy:#1A2744;--navy-mid:#243460;--navy-light:#EEF1F8;--ink:#111;--ink-mid:#2C2C2C;--ink-light:#555;--smoke:#F8F7F5;--cloud:#EEEDE9;--mist:#E2E1DC;--white:#fff;--sans:'Noto Sans TC',sans-serif;--display:'Playfair Display',Georgia,serif}
+html{scroll-behavior:smooth}
+body{font-family:var(--sans);background:var(--smoke);color:var(--ink);line-height:1.6;-webkit-font-smoothing:antialiased}
+a{text-decoration:none;color:inherit}
+img{display:block;width:100%;height:100%;object-fit:cover}
+button{cursor:pointer;font-family:var(--sans);border:none;background:none}
+
+.topbar{background:var(--navy);color:#aab4cc;font-size:.73rem;padding:.35rem 0;border-bottom:1px solid #2d3f6a}
+.topbar-inner{max-width:1280px;margin:0 auto;padding:0 1.5rem;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:.5rem}
+.update-badge{background:rgba(192,57,43,.25);color:#ff9d94;border:1px solid rgba(192,57,43,.4);font-size:.65rem;font-weight:700;letter-spacing:.08em;padding:.18rem .55rem;border-radius:20px}
+
+header{background:var(--white);border-bottom:3px solid var(--red)}
+.header-main{max-width:1280px;margin:0 auto;padding:.9rem 1.5rem;display:flex;align-items:center;justify-content:space-between;gap:1rem}
+.logo-en{font-family:var(--display);font-size:1.9rem;font-weight:900;color:var(--ink);letter-spacing:-.02em;line-height:1}
+.logo-zh{font-size:.68rem;letter-spacing:.28em;color:var(--red);font-weight:700;margin-top:.08rem}
+.header-right{display:flex;align-items:center;gap:.75rem}
+.search-wrap{position:relative;flex:1;min-width:180px;max-width:280px}
+.search-wrap input{width:100%;padding:.44rem .9rem .44rem 2.1rem;border:1.5px solid var(--mist);border-radius:2px;font-size:.84rem;font-family:var(--sans);background:var(--smoke);color:var(--ink);outline:none;transition:.2s}
+.search-wrap input:focus{border-color:var(--navy);background:var(--white)}
+.search-wrap svg{position:absolute;left:.6rem;top:50%;transform:translateY(-50%);width:14px;height:14px;stroke:var(--ink-light);fill:none;stroke-width:2;pointer-events:none}
+.search-clear{position:absolute;right:.55rem;top:50%;transform:translateY(-50%);width:17px;height:17px;border-radius:50%;background:var(--mist);color:var(--ink-light);font-size:.65rem;display:none;align-items:center;justify-content:center;cursor:pointer}
+.search-clear.visible{display:flex}
+.btn-sub{background:var(--red);color:#fff;padding:.44rem 1.1rem;font-size:.78rem;font-weight:700;letter-spacing:.05em;border-radius:2px;transition:.2s}
+.btn-sub:hover{background:var(--red-dark)}
+
+nav.primary{background:var(--navy);position:sticky;top:0;z-index:100;box-shadow:0 2px 12px rgba(0,0,0,.18)}
+.nav-inner{max-width:1280px;margin:0 auto;padding:0 1.5rem;display:flex;align-items:center;overflow-x:auto;scrollbar-width:none}
+.nav-inner::-webkit-scrollbar{display:none}
+nav.primary a{color:#c8d0e4;font-size:.81rem;font-weight:500;letter-spacing:.04em;padding:.8rem 1rem;display:inline-block;border-bottom:2.5px solid transparent;transition:.2s;white-space:nowrap;cursor:pointer}
+nav.primary a:hover,nav.primary a.active{color:#fff;border-bottom-color:var(--red)}
+.nav-sep{width:1px;height:18px;background:#2d3f6a;margin:0 .3rem;flex-shrink:0}
+.nav-lbl{font-size:.6rem;color:#6e7f9e;letter-spacing:.12em;padding:0 .5rem;flex-shrink:0}
+
+.ticker{background:var(--red);color:#fff;display:flex;align-items:stretch;overflow:hidden}
+.ticker-badge{background:var(--red-dark);font-size:.68rem;font-weight:700;letter-spacing:.1em;padding:.46rem 1rem;white-space:nowrap;display:flex;align-items:center;gap:.4rem;flex-shrink:0}
+.tdot{width:7px;height:7px;border-radius:50%;background:#fff;animation:blink 1.2s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+.ticker-track{flex:1;overflow:hidden;padding:.46rem .8rem;font-size:.77rem;display:flex;align-items:center}
+.ticker-inner{display:flex;gap:3rem;white-space:nowrap;animation:tscroll 45s linear infinite}
+.ticker-inner span::before{content:'▸ ';opacity:.6}
+@keyframes tscroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+
+.site-wrap{max-width:1280px;margin:0 auto;padding:0 1.5rem}
+
+.status-bar{display:flex;align-items:center;gap:.75rem;padding:.65rem 0;border-bottom:1px solid var(--mist);margin-bottom:1.5rem;flex-wrap:wrap}
+.spill{background:var(--navy-light);color:var(--navy);font-size:.73rem;font-weight:600;padding:.22rem .72rem;border-radius:20px;display:flex;align-items:center;gap:.38rem;animation:popin .25s ease}
+.spill .x{width:13px;height:13px;border-radius:50%;background:var(--navy);color:#fff;font-size:.55rem;display:flex;align-items:center;justify-content:center;cursor:pointer;opacity:.7}
+.spill .x:hover{opacity:1}
+@keyframes popin{from{opacity:0;transform:scale(.85)}to{opacity:1;transform:scale(1)}}
+.rcount{font-size:.75rem;color:var(--ink-light);margin-left:auto}
+
+.hero-grid{display:grid;grid-template-columns:1fr 330px;gap:1.5rem;margin:1.5rem 0}
+.hero-main{position:relative;border-radius:2px;overflow:hidden;min-height:460px;background:var(--cloud);cursor:pointer}
+.hero-img{position:absolute;inset:0;background-size:cover;background-position:center 30%;transition:transform .5s}
+.hero-main:hover .hero-img{transform:scale(1.03)}
+.hero-ov{position:absolute;inset:0;background:linear-gradient(to top,rgba(8,12,28,.93) 0%,rgba(8,12,28,.48) 42%,transparent 72%)}
+.hero-body{position:absolute;bottom:0;left:0;right:0;padding:1.75rem}
+.htag{font-size:.64rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:#ff8a7a;margin-bottom:.5rem}
+.hhl{font-family:var(--display);font-size:1.85rem;font-weight:700;color:#fff;line-height:1.18;margin-bottom:.7rem}
+.hdesc{font-size:.9rem;color:rgba(255,255,255,.8);line-height:1.62;margin-bottom:.85rem}
+.hmeta{display:flex;align-items:center;gap:.9rem;font-size:.69rem;color:rgba(255,255,255,.55)}
+.hmeta .by{color:rgba(255,255,255,.8);font-weight:500}
+.hbadge{position:absolute;top:.9rem;left:.9rem;background:var(--red);color:#fff;font-size:.63rem;font-weight:700;letter-spacing:.1em;padding:.18rem .5rem;border-radius:1px}
+
+.sidebar-flash{display:flex;flex-direction:column}
+.sidebar-hd{background:var(--navy);color:#fff;padding:.7rem 1rem;font-size:.76rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;display:flex;align-items:center;gap:.5rem;border-radius:2px 2px 0 0}
+.sidebar-scroll{overflow-y:auto;background:var(--white);border:1px solid var(--mist);border-top:none;max-height:460px;border-radius:0 0 2px 2px}
+.sidebar-scroll::-webkit-scrollbar{width:3px}
+.sidebar-scroll::-webkit-scrollbar-thumb{background:var(--mist)}
+.fi{padding:.85rem 1rem;border-bottom:1px solid var(--cloud);transition:.2s;cursor:pointer}
+.fi:hover{background:var(--smoke)}
+.fi:last-child{border-bottom:none}
+.ft{font-size:.65rem;color:var(--red);font-weight:700;letter-spacing:.06em;margin-bottom:.18rem}
+.fh{font-size:.8rem;line-height:1.42;color:var(--ink-mid);font-weight:500;transition:.2s}
+.fi:hover .fh{color:var(--red)}
+.fr{font-size:.61rem;color:var(--ink-light);margin-top:.25rem}
+
+.sec-hd{display:flex;align-items:center;gap:.75rem;margin:2rem 0 1rem;padding-bottom:.5rem;border-bottom:2.5px solid var(--ink)}
+.sec-hd h2{font-family:var(--display);font-size:1.06rem;font-weight:700}
+.sec-hd .more{margin-left:auto;font-size:.71rem;color:var(--red);font-weight:600;cursor:pointer}
+.sec-hd .more:hover{text-decoration:underline}
+.rchip{font-size:.6rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:.17rem .48rem;border-radius:1px}
+.chip-asia{background:#E8F4FF;color:#0D5FAB}
+.chip-europe{background:#FFF0E8;color:#C04E00}
+.chip-americas{background:#E8FAF0;color:#166E3C}
+.chip-mideast{background:#F0EBF8;color:#6B3FA0}
+.chip-africa{background:#FFF8E8;color:#9A6B00}
+.chip-global{background:#F0F0F0;color:#444}
+.chip-tech{background:#E8F8FF;color:#005F8A}
+.chip-finance{background:#F0FBF0;color:#1A6B1A}
+.chip-breaking{background:var(--red);color:#fff}
+
+.news-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1.5rem;margin-bottom:2rem}
+.nc{background:var(--white);border:1px solid var(--mist);border-radius:2px;overflow:hidden;transition:.2s;cursor:pointer;display:flex;flex-direction:column}
+.nc:hover{transform:translateY(-3px);box-shadow:0 6px 24px rgba(0,0,0,.1)}
+.nc .thumb{height:185px;background:var(--cloud);overflow:hidden;flex-shrink:0;position:relative}
+.nc .thumb img{width:100%;height:100%;object-fit:cover;transition:.4s;display:block}
+.nc:hover .thumb img{transform:scale(1.05)}
+.nc .bb{position:absolute;top:.45rem;left:.45rem;background:var(--red);color:#fff;font-size:.58rem;font-weight:700;letter-spacing:.08em;padding:.13rem .4rem;border-radius:1px}
+.nc .body{padding:.95rem;display:flex;flex-direction:column;flex:1}
+.nc .ct{font-family:'Georgia',serif;font-size:.95rem;font-weight:600;line-height:1.35;color:var(--ink);margin:.4rem 0;flex:1;transition:.2s}
+.nc:hover .ct{color:var(--red)}
+.nc .cd{font-size:.78rem;color:var(--ink-light);line-height:1.55;margin-bottom:.55rem;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.nc .cf{display:flex;gap:.55rem;font-size:.66rem;color:var(--ink-light);border-top:1px solid var(--cloud);padding-top:.5rem;margin-top:auto;flex-wrap:wrap}
+.nc .cf span+span::before{content:'·';margin-right:.35rem}
+.nc .cf .rb{margin-left:auto;color:var(--red);font-weight:600}
+
+.photo-strip{display:grid;grid-template-columns:repeat(4,1fr);gap:.75rem;margin:2rem 0}
+.pc{position:relative;height:196px;border-radius:2px;overflow:hidden;background:var(--cloud);cursor:pointer}
+.pc img{width:100%;height:100%;object-fit:cover;transition:.4s}
+.pc:hover img{transform:scale(1.06)}
+.pov{position:absolute;inset:0;background:linear-gradient(to top,rgba(0,0,0,.76) 0%,transparent 55%)}
+.pcap{position:absolute;bottom:0;left:0;right:0;padding:.68rem;color:#fff;font-size:.71rem;line-height:1.33}
+.pcap strong{display:block;font-weight:600;margin-bottom:.1rem}
+
+.rg{display:grid;grid-template-columns:2fr 1fr 1fr;gap:1.5rem}
+.rl{background:var(--white);border:1px solid var(--mist);border-radius:2px;overflow:hidden;cursor:pointer;transition:.2s}
+.rl:hover{box-shadow:0 4px 16px rgba(0,0,0,.09)}
+.rl .rt{height:230px;overflow:hidden}
+.rl .rt img{width:100%;height:100%;object-fit:cover;transition:.4s}
+.rl:hover .rt img{transform:scale(1.04)}
+.rl .rb2{padding:1.1rem}
+.rl .rb2 h3{font-family:'Georgia',serif;font-size:1.15rem;font-weight:600;line-height:1.28;margin-bottom:.5rem;transition:.2s}
+.rl:hover .rb2 h3{color:var(--red)}
+.rl .rb2 p{font-size:.82rem;color:var(--ink-light);line-height:1.6;margin-bottom:.45rem}
+.rs{display:flex;flex-direction:column;gap:.85rem}
+.rb3{background:var(--white);border:1px solid var(--mist);border-radius:2px;padding:.85rem 1rem;transition:.2s;cursor:pointer}
+.rb3:hover{background:var(--smoke);box-shadow:0 2px 8px rgba(0,0,0,.06)}
+.rb3 h4{font-family:'Georgia',serif;font-size:.88rem;font-weight:600;line-height:1.37;transition:.2s;margin-top:.3rem}
+.rb3:hover h4{color:var(--red)}
+.rb3 .bm{font-size:.65rem;color:var(--ink-light);margin-top:.35rem}
+
+.op-band{background:var(--navy-light);border-top:3px solid var(--navy);border-bottom:3px solid var(--navy);padding:1.5rem 0;margin:2.5rem 0}
+.op-inner{max-width:1280px;margin:0 auto;padding:0 1.5rem}
+.op-lbl{font-size:.66rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--navy);margin-bottom:1rem}
+.op-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:1.5rem}
+.opc{background:var(--white);border:1px solid var(--mist);padding:1rem;border-radius:2px}
+.opa{width:36px;height:36px;border-radius:50%;background:var(--navy-light);margin-bottom:.6rem;font-size:.95rem;font-weight:700;display:flex;align-items:center;justify-content:center;color:var(--navy-mid)}
+.opn{font-size:.71rem;font-weight:700;color:var(--navy)}
+.opr{font-size:.7rem;color:var(--ink-light);margin-bottom:.5rem;font-style:italic}
+.oph{font-family:'Georgia',serif;font-size:.84rem;font-weight:600;line-height:1.4}
+
+/* MODAL */
+.moverlay{position:fixed;inset:0;background:rgba(8,12,28,.75);z-index:1000;display:flex;align-items:flex-start;justify-content:center;padding:3rem 1rem 1rem;opacity:0;pointer-events:none;transition:opacity .3s;overflow-y:auto}
+.moverlay.open{opacity:1;pointer-events:all}
+.mbox{background:var(--white);border-radius:3px;max-width:740px;width:100%;position:relative;transform:translateY(20px);transition:transform .35s;flex-shrink:0;margin-bottom:3rem}
+.moverlay.open .mbox{transform:translateY(0)}
+.mhero{position:relative;height:320px;overflow:hidden;border-radius:3px 3px 0 0;background:var(--cloud)}
+.mhero img{width:100%;height:100%;object-fit:cover}
+.mhov{position:absolute;inset:0;background:linear-gradient(to top,rgba(8,12,28,.75) 0%,transparent 60%)}
+.mht{position:absolute;bottom:1.4rem;left:1.4rem;right:1.4rem}
+.mk{font-size:.67rem;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:#ff8a7a;margin-bottom:.38rem}
+.mt{font-family:var(--display);font-size:1.55rem;font-weight:700;color:#fff;line-height:1.18}
+.mcl{position:absolute;top:.9rem;right:.9rem;width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,.15);backdrop-filter:blur(4px);color:#fff;font-size:1rem;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:.2s;border:1px solid rgba(255,255,255,.2)}
+.mcl:hover{background:rgba(255,255,255,.28)}
+.mbody{padding:1.6rem 1.9rem 1.9rem}
+.mmeta{display:flex;align-items:center;gap:.9rem;font-size:.71rem;color:var(--ink-light);margin-bottom:1.2rem;flex-wrap:wrap;padding-bottom:.9rem;border-bottom:1px solid var(--mist)}
+.mmeta .by{font-weight:600;color:var(--ink-mid)}
+.msum{font-size:.97rem;color:var(--ink-mid);line-height:1.72;margin-bottom:1.4rem;padding:.95rem;background:var(--smoke);border-left:3px solid var(--red);border-radius:0 2px 2px 0}
+.mcont{font-size:.94rem;color:var(--ink-mid);line-height:1.85}
+.mcont p{margin-bottom:1rem}
+.mcont h3{font-family:var(--display);font-size:1.02rem;font-weight:700;margin:1.4rem 0 .55rem;padding-bottom:.3rem;border-bottom:1px solid var(--cloud)}
+.mcont a{color:var(--red);font-weight:600}
+.mtags{display:flex;gap:.45rem;flex-wrap:wrap;margin-top:1.4rem;padding-top:.9rem;border-top:1px solid var(--mist)}
+.mtag{background:var(--smoke);border:1px solid var(--mist);color:var(--ink-light);font-size:.7rem;padding:.2rem .55rem;border-radius:1px;cursor:pointer;transition:.2s}
+.mtag:hover{background:var(--cloud)}
+.macts{display:flex;gap:.7rem;margin-top:1.2rem;padding-top:.9rem;border-top:1px solid var(--mist)}
+.btn-rm{background:var(--red);color:#fff;padding:.52rem 1.2rem;font-size:.8rem;font-weight:700;border-radius:2px;transition:.2s}
+.btn-rm:hover{background:var(--red-dark)}
+.btn-sh{background:var(--smoke);border:1px solid var(--mist);color:var(--ink-mid);padding:.52rem 1.05rem;font-size:.8rem;border-radius:2px;transition:.2s}
+.btn-sh:hover{background:var(--cloud)}
+.mnav{display:flex;justify-content:space-between;margin-top:1.2rem;padding-top:.9rem;border-top:1px solid var(--cloud)}
+.mnbtn{display:flex;align-items:center;gap:.38rem;font-size:.76rem;color:var(--navy);font-weight:600;cursor:pointer;padding:.38rem .55rem;border-radius:2px;transition:.2s}
+.mnbtn:hover{background:var(--navy-light)}
+.mnbtn:disabled{color:var(--mist);cursor:default;pointer-events:none}
+
+mark{background:#FFF3CD;color:var(--ink);border-radius:1px;padding:0 1px}
+.empty{text-align:center;padding:4rem 2rem;color:var(--ink-light)}
+.empty h3{font-size:1.05rem;margin-bottom:.4rem;color:var(--ink-mid)}
+
+footer{background:var(--ink);color:#9aA3B5;margin-top:3rem}
+.fg{max-width:1280px;margin:0 auto;padding:2.5rem 1.5rem;display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:3rem}
+.fb .logo-en{color:#fff;font-family:var(--display);font-size:1.45rem;font-weight:900}
+.fb .logo-zh{color:var(--red);font-size:.66rem;letter-spacing:.28em}
+.fb p{font-size:.76rem;line-height:1.6;color:#5a6678;max-width:200px;margin-top:.65rem}
+.fc h4{color:#fff;font-size:.74rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;margin-bottom:.7rem;padding-bottom:.38rem;border-bottom:1px solid #222a38}
+.fc ul{list-style:none;display:flex;flex-direction:column;gap:.42rem}
+.fc a{font-size:.76rem;color:#5a6678;transition:.2s}
+.fc a:hover{color:#fff}
+.fbot{border-top:1px solid #1a2230;max-width:1280px;margin:0 auto;padding:.85rem 1.5rem;display:flex;justify-content:space-between;font-size:.68rem;color:#3d4a5a;flex-wrap:wrap;gap:.5rem}
+
+@media(max-width:1024px){.hero-grid{grid-template-columns:1fr}.rg{grid-template-columns:1fr 1fr}.op-grid{grid-template-columns:repeat(2,1fr)}.fg{grid-template-columns:1fr 1fr;gap:2rem}}
+@media(max-width:768px){.news-grid{grid-template-columns:1fr}.rg{grid-template-columns:1fr}.photo-strip{grid-template-columns:1fr 1fr}.moverlay{padding:0;align-items:flex-end}.mbox{border-radius:16px 16px 0 0;max-height:92vh;overflow-y:auto}.mt{font-size:1.2rem}.mbody{padding:1.2rem}.op-grid{grid-template-columns:1fr}.fg{grid-template-columns:1fr}}
+@media(max-width:480px){.photo-strip{grid-template-columns:1fr}.hhl{font-size:1.4rem}.fg{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <span style="font-weight:300;opacity:.85">%%DATE%% ｜ 台北時間 %%TIME%%</span>
+    <span class="update-badge">🔄 自動更新於 %%UPDATED%%</span>
+  </div>
+</div>
+
+<header>
+  <div class="header-main">
+    <div>
+      <div class="logo-en">WorldPulse</div>
+      <div class="logo-zh">環球快報</div>
+    </div>
+    <div class="header-right">
+      <div class="search-wrap">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="22" y2="22"/></svg>
+        <input type="search" id="search-input" placeholder="搜尋新聞、地區、主題…" autocomplete="off">
+        <span class="search-clear" id="search-clear">✕</span>
+      </div>
+      <button class="btn-sub">訂閱</button>
+    </div>
+  </div>
+</header>
+
+<nav class="primary">
+  <div class="nav-inner" id="primary-nav">
+    <a data-region="all" class="active" onclick="filterRegion(this,'all')">首頁</a>
+    <a data-region="all" onclick="filterRegion(this,'all')">即時</a>
+    <div class="nav-sep"></div>
+    <span class="nav-lbl">地區</span>
+    <a data-region="asia"     onclick="filterRegion(this,'asia')">亞太</a>
+    <a data-region="europe"   onclick="filterRegion(this,'europe')">歐美</a>
+    <a data-region="americas" onclick="filterRegion(this,'americas')">美洲</a>
+    <a data-region="mideast"  onclick="filterRegion(this,'mideast')">中東</a>
+    <a data-region="africa"   onclick="filterRegion(this,'africa')">非洲</a>
+    <a data-region="global"   onclick="filterRegion(this,'global')">全球</a>
+    <div class="nav-sep"></div>
+    <a data-region="tech"    onclick="filterRegion(this,'tech')">科技</a>
+    <a data-region="finance" onclick="filterRegion(this,'finance')">財經</a>
+  </div>
+</nav>
+
+<div class="ticker">
+  <div class="ticker-badge"><span class="tdot"></span>即時快訊</div>
+  <div class="ticker-track">
+    <div class="ticker-inner" id="ticker-inner"></div>
+  </div>
+</div>
+
+<div class="site-wrap">
+  <div class="status-bar" id="status-bar" style="display:none">
+    <div id="filter-pill"></div>
+    <div id="search-pill"></div>
+    <span class="rcount" id="result-count"></span>
+  </div>
+
+  <div id="hero-section">
+    <div class="hero-grid">
+      <div class="hero-main" id="hero-card">
+        <div class="hero-img" id="hero-img"></div>
+        <div class="hero-ov"></div>
+        <div class="hero-body">
+          <div class="htag" id="hero-tag"></div>
+          <h1 class="hhl" id="hero-hl"></h1>
+          <p class="hdesc" id="hero-desc"></p>
+          <div class="hmeta" id="hero-meta"></div>
+        </div>
+        <span class="hbadge" id="hero-badge" style="display:none">即時</span>
+      </div>
+      <div class="sidebar-flash">
+        <div class="sidebar-hd"><span class="tdot"></span>國際焦點快報</div>
+        <div class="sidebar-scroll" id="sidebar-scroll"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="dynamic-section">
+    <div id="filtered-section" style="display:none">
+      <div class="sec-hd">
+        <span style="width:34px;height:3px;background:var(--red);display:inline-block"></span>
+        <h2 id="filtered-title">篩選結果</h2>
+      </div>
+      <div class="news-grid" id="filtered-grid"></div>
+      <div id="empty-state" class="empty" style="display:none">
+        <h3>找不到相關新聞</h3>
+        <p>請嘗試其他關鍵字，或 <button style="color:var(--red);font-size:.83rem;font-weight:600;cursor:pointer" onclick="clearAll()">清除篩選</button></p>
+      </div>
+    </div>
+
+    <div id="default-section">
+      <div class="sec-hd">
+        <span style="width:34px;height:3px;background:var(--red);display:inline-block"></span>
+        <h2>重點新聞</h2>
+        <span class="more" onclick="filterRegion(null,'all')">更多 →</span>
+      </div>
+      <div class="news-grid" id="secondary-grid"></div>
+      <div class="photo-strip" id="photo-strip"></div>
+
+      <div class="sec-hd" id="sec-hd-asia">
+        <span style="width:34px;height:3px;background:var(--red);display:inline-block"></span>
+        <h2>亞太焦點</h2>
+        <span class="rchip chip-asia">ASIA PACIFIC</span>
+        <span class="more" onclick="filterRegion(null,'asia')">更多 →</span>
+      </div>
+      <div class="rg" id="region-asia"></div>
+
+      <div class="sec-hd" style="margin-top:2rem">
+        <span style="width:34px;height:3px;background:var(--red);display:inline-block"></span>
+        <h2>歐美要聞</h2>
+        <span class="rchip chip-europe">EUROPE & AMERICAS</span>
+        <span class="more" onclick="filterRegion(null,'europe')">更多 →</span>
+      </div>
+      <div class="rg" id="region-europe"></div>
+    </div>
+  </div>
+</div>
+
+<div class="op-band">
+  <div class="op-inner">
+    <div class="op-lbl">評論與分析</div>
+    <div class="op-grid">
+      <div class="opc"><div class="opa">陳</div><div class="opn">陳世昌</div><div class="opr">國際關係資深分析師</div><div class="oph">大國博弈的新格局：從峰會看未來十年走向</div></div>
+      <div class="opc"><div class="opa">林</div><div class="opn">林佩璇</div><div class="opr">科技政策研究員</div><div class="oph">AI監管浪潮：歐盟的佈局與全球的跟隨</div></div>
+      <div class="opc"><div class="opa">王</div><div class="opn">王思涵</div><div class="opr">氣候政策特派記者</div><div class="oph">氣候正義缺席的峰會：富國承諾的空洞化</div></div>
+      <div class="opc"><div class="opa">M</div><div class="opn">Mohamed K.</div><div class="opr">中東事務特約記者</div><div class="oph">伊朗戰事與能源危機：中東新秩序的形成</div></div>
+    </div>
+  </div>
+</div>
+
+<div class="site-wrap">
+  <div class="sec-hd" style="margin-top:.5rem">
+    <span style="width:34px;height:3px;background:var(--red);display:inline-block"></span>
+    <h2>中東與非洲</h2>
+    <span class="rchip chip-mideast">MIDDLE EAST & AFRICA</span>
+    <span class="more" onclick="filterRegion(null,'mideast')">更多 →</span>
+  </div>
+  <div class="rg" id="region-mideast"></div>
+</div>
+
+<footer>
+  <div class="fg">
+    <div class="fb"><div class="logo-en">WorldPulse</div><div class="logo-zh">環球快報</div><p>公正、深度、即時。以中文報導全球每一個重要時刻。由 GitHub Actions 自動每日更新。</p></div>
+    <div class="fc"><h4>地區報導</h4><ul><li><a href="#">亞太</a></li><li><a href="#">歐洲</a></li><li><a href="#">美洲</a></li><li><a href="#">中東</a></li><li><a href="#">非洲</a></li></ul></div>
+    <div class="fc"><h4>主題分類</h4><ul><li><a href="#">科技與AI</a></li><li><a href="#">氣候環境</a></li><li><a href="#">全球財經</a></li><li><a href="#">外交安全</a></li></ul></div>
+    <div class="fc"><h4>關於</h4><ul><li><a href="#">編輯政策</a></li><li><a href="#">資料來源</a></li><li><a href="news_data.json" target="_blank">原始 JSON</a></li></ul></div>
+  </div>
+  <div class="fbot">
+    <span>© 2026 WorldPulse 環球快報　新聞資料來源：NewsAPI</span>
+    <span>最後更新：%%UPDATED%%</span>
+  </div>
+</footer>
+
+<!-- MODAL -->
+<div class="moverlay" id="moverlay" onclick="handleOvClick(event)">
+  <div class="mbox" id="mbox">
+    <div class="mhero">
+      <img id="m-img" src="" alt="">
+      <div class="mhov"></div>
+      <div class="mht">
+        <div class="mk" id="m-kicker"></div>
+        <h2 class="mt" id="m-title"></h2>
+      </div>
+      <button class="mcl" onclick="closeModal()">✕</button>
+    </div>
+    <div class="mbody">
+      <div class="mmeta" id="m-meta"></div>
+      <div class="msum" id="m-sum"></div>
+      <div class="mcont" id="m-cont"></div>
+      <div class="mtags" id="m-tags"></div>
+      <div class="macts">
+        <button class="btn-rm" id="m-readbtn" onclick="openSource()">前往原文來源</button>
+        <button class="btn-sh" onclick="shareArticle()">分享</button>
+      </div>
+      <div class="mnav">
+        <button class="mnbtn" id="m-prev" onclick="navModal(-1)">← 上一篇</button>
+        <button class="mnbtn" id="m-next" onclick="navModal(1)">下一篇 →</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const NEWS_DATA = %%ARTICLES_JSON%%;
+
+const RC = {all:{l:'全部',c:'chip-global'},asia:{l:'亞太',c:'chip-asia'},europe:{l:'歐美',c:'chip-europe'},americas:{l:'美洲',c:'chip-americas'},mideast:{l:'中東',c:'chip-mideast'},africa:{l:'非洲',c:'chip-africa'},global:{l:'全球',c:'chip-global'},tech:{l:'科技',c:'chip-tech'},finance:{l:'財經',c:'chip-finance'}};
+
+let curRegion='all',curSearch='',curIdx=0,searchTimer;
+
+function timeAgo(iso){
+  const d=Date.now()-new Date(iso).getTime();
+  const m=Math.floor(d/60000);
+  if(m<60)return m+'分鐘前';
+  const h=Math.floor(m/60);
+  if(h<24)return h+'小時前';
+  return Math.floor(h/24)+'天前';
+}
+function chip(region,cat){const c=RC[region]||RC.global;return `<span class="rchip ${c.c}">${cat||c.l}</span>`}
+function hl(t,q){if(!q)return t;return t.replace(new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')})`,'gi'),'<mark>$1</mark>')}
+
+function buildCard(a,q=''){
+  return `<div class="nc" onclick="openModal('${a.id}')">
+    <div class="thumb">${a.imageUrl?`<img src="${a.imageUrl}" alt="${a.imageAlt||''}" loading="lazy">`:''}${a.breaking?'<span class="bb">即時</span>':''}</div>
+    <div class="body">
+      <div>${chip(a.region,a.category)}</div>
+      <div class="ct">${hl(a.title,q)}</div>
+      <p class="cd">${hl(a.summary,q)}</p>
+      <div class="cf"><span>${a.author}</span><span>${timeAgo(a.publishedAt)}</span><span class="rb">閱讀 →</span></div>
+    </div></div>`;
+}
+
+function renderHero(a){
+  document.getElementById('hero-img').style.backgroundImage=`url('${a.imageUrl}')`;
+  document.getElementById('hero-tag').textContent=`🔴 今日焦點 · ${a.category}`;
+  document.getElementById('hero-hl').textContent=a.title;
+  document.getElementById('hero-desc').textContent=a.summary;
+  document.getElementById('hero-meta').innerHTML=`<span class="by">${a.author}</span><span>${timeAgo(a.publishedAt)}</span><span>閱讀 ${a.readingTime} 分鐘</span>`;
+  const b=document.getElementById('hero-badge');
+  b.style.display=a.breaking?'block':'none';
+  document.getElementById('hero-card').onclick=()=>openModal(a.id);
+}
+
+function renderSidebar(){
+  const sorted=[...NEWS_DATA].sort((a,b)=>new Date(b.publishedAt)-new Date(a.publishedAt));
+  document.getElementById('sidebar-scroll').innerHTML=sorted.map(a=>`
+    <div class="fi" onclick="openModal('${a.id}')">
+      <div class="ft">${timeAgo(a.publishedAt)}</div>
+      <div class="fh">${a.title}</div>
+      <div class="fr">${a.country} · ${a.category}</div>
+    </div>`).join('');
+}
+
+function renderTicker(){
+  const t=NEWS_DATA.filter(a=>a.breaking).slice(0,6);
+  const doubled=[...t,...t];
+  document.getElementById('ticker-inner').innerHTML=doubled.map(a=>`<span>${a.title}</span>`).join('');
+}
+
+function renderRegion(cid,region){
+  const arts=NEWS_DATA.filter(a=>a.region===region||a.region===region+'2');
+  if(!arts.length){const el=document.getElementById(cid);if(el)el.innerHTML='<p style="color:var(--ink-light);padding:1rem">目前暫無此地區新聞</p>';return;}
+  const lead=arts[0];const briefs=arts.slice(1,5);const half=Math.ceil(briefs.length/2);
+  const el=document.getElementById(cid);if(!el)return;
+  el.innerHTML=`
+    <div class="rl" onclick="openModal('${lead.id}')">
+      <div class="rt">${lead.imageUrl?`<img src="${lead.imageUrl}" alt="" loading="lazy">`:'<div style="width:100%;height:100%;background:var(--cloud)"></div>'}</div>
+      <div class="rb2"><div style="margin-bottom:.4rem">${chip(lead.region,lead.category)}</div><h3>${lead.title}</h3><p>${lead.summary}</p><div style="font-size:.71rem;color:var(--ink-light)">${lead.author} · ${timeAgo(lead.publishedAt)}</div></div>
+    </div>
+    <div class="rs">${briefs.slice(0,half).map(a=>`<div class="rb3" onclick="openModal('${a.id}')"><div>${chip(a.region,a.category)}</div><h4>${a.title}</h4><div class="bm">${timeAgo(a.publishedAt)} · ${a.country}</div></div>`).join('')}</div>
+    <div class="rs">${briefs.slice(half).map(a=>`<div class="rb3" onclick="openModal('${a.id}')"><div>${chip(a.region,a.category)}</div><h4>${a.title}</h4><div class="bm">${timeAgo(a.publishedAt)} · ${a.country}</div></div>`).join('')}</div>`;
+}
+
+function renderPhotoStrip(){
+  const picks=NEWS_DATA.slice(0,4);
+  document.getElementById('photo-strip').innerHTML=picks.map(a=>`
+    <div class="pc" onclick="openModal('${a.id}')">
+      ${a.imageUrl?`<img src="${a.imageUrl}" alt="" loading="lazy">`:''}
+      <div class="pov"></div>
+      <div class="pcap"><strong>${a.category}</strong>${a.country}</div>
+    </div>`).join('');
+}
+
+function renderDefault(){
+  if(!NEWS_DATA.length)return;
+  renderHero(NEWS_DATA[0]);
+  renderSidebar();
+  renderTicker();
+  document.getElementById('secondary-grid').innerHTML=NEWS_DATA.slice(1,4).map(a=>buildCard(a)).join('');
+  renderPhotoStrip();
+  renderRegion('region-asia','asia');
+  renderRegion('region-europe','europe');
+  renderRegion('region-mideast','mideast');
+}
+
+function applyFilters(){
+  const q=curSearch.trim().toLowerCase();
+  const r=curRegion;
+  const results=NEWS_DATA.filter(a=>{
+    const mr=r==='all'||a.region===r;
+    const ms=!q||a.title.toLowerCase().includes(q)||a.summary.toLowerCase().includes(q)||a.country.toLowerCase().includes(q);
+    return mr&&ms;
+  });
+  const hasFilter=r!=='all'||q!=='';
+  document.getElementById('hero-section').style.display=hasFilter?'none':'';
+  document.getElementById('default-section').style.display=hasFilter?'none':'';
+  document.getElementById('filtered-section').style.display=hasFilter?'':'none';
+  document.getElementById('status-bar').style.display=hasFilter?'flex':'none';
+  if(hasFilter){
+    const c=RC[r]||RC.all;
+    document.getElementById('filter-pill').innerHTML=r!=='all'?`<span class="spill">${c.l}<span class="x" onclick="clearRegion()">✕</span></span>`:'';
+    document.getElementById('search-pill').innerHTML=q?`<span class="spill">「${q}」<span class="x" onclick="clearSearch()">✕</span></span>`:'';
+    document.getElementById('result-count').textContent=`共 ${results.length} 篇`;
+    document.getElementById('filtered-title').textContent=r!=='all'?(c.l+'新聞'):q?`「${q}」搜尋結果`:'篩選結果';
+    const grid=document.getElementById('filtered-grid');
+    const empty=document.getElementById('empty-state');
+    if(!results.length){grid.innerHTML='';empty.style.display='';}
+    else{empty.style.display='none';grid.innerHTML=results.map(a=>buildCard(a,q)).join('');}
+  }
+}
+
+function filterRegion(el,r){
+  curRegion=r;
+  document.querySelectorAll('#primary-nav a[data-region]').forEach(a=>a.classList.remove('active'));
+  if(el)el.classList.add('active');
+  else{const t=document.querySelector(`#primary-nav a[data-region="${r}"]`);if(t)t.classList.add('active');}
+  applyFilters();
+}
+function clearRegion(){curRegion='all';document.querySelectorAll('#primary-nav a[data-region]').forEach(a=>a.classList.remove('active'));document.querySelector('#primary-nav a[data-region="all"]').classList.add('active');applyFilters();}
+function clearSearch(){document.getElementById('search-input').value='';document.getElementById('search-clear').classList.remove('visible');curSearch='';applyFilters();}
+function clearAll(){clearSearch();clearRegion();}
+
+document.getElementById('search-input').addEventListener('input',function(){
+  clearTimeout(searchTimer);
+  document.getElementById('search-clear').classList.toggle('visible',this.value.length>0);
+  const v=this.value;
+  searchTimer=setTimeout(()=>{curSearch=v;applyFilters();},220);
+});
+document.getElementById('search-clear').addEventListener('click',clearSearch);
+
+// MODAL
+function openModal(id){
+  const idx=NEWS_DATA.findIndex(a=>a.id===id);
+  if(idx<0)return;
+  curIdx=idx;
+  populateModal(NEWS_DATA[idx]);
+  document.getElementById('moverlay').classList.add('open');
+  document.body.style.overflow='hidden';
+  document.getElementById('moverlay').scrollTop=0;
+}
+function populateModal(a){
+  document.getElementById('m-img').src=a.imageUrl||'';
+  document.getElementById('m-kicker').textContent=`${a.country} · ${a.category}`;
+  document.getElementById('m-title').textContent=a.title;
+  document.getElementById('m-meta').innerHTML=`<span class="by">${a.author}</span><span>${new Date(a.publishedAt).toLocaleString('zh-TW',{month:'long',day:'numeric',hour:'2-digit',minute:'2-digit'})}</span>${chip(a.region)}${a.breaking?'<span class="rchip chip-breaking">即時</span>':''}`;
+  document.getElementById('m-sum').textContent=a.summary;
+  document.getElementById('m-cont').innerHTML=a.content||`<p>${a.summary}</p>`;
+  document.getElementById('m-tags').innerHTML=a.tags.map(t=>`<span class="mtag" onclick="searchTag('${t}')"># ${t}</span>`).join('');
+  document.getElementById('m-prev').disabled=curIdx<=0;
+  document.getElementById('m-next').disabled=curIdx>=NEWS_DATA.length-1;
+  document.getElementById('mbox').scrollTop=0;
+}
+function closeModal(){document.getElementById('moverlay').classList.remove('open');document.body.style.overflow='';}
+function handleOvClick(e){if(e.target===document.getElementById('moverlay'))closeModal();}
+function navModal(d){const n=curIdx+d;if(n<0||n>=NEWS_DATA.length)return;curIdx=n;populateModal(NEWS_DATA[n]);document.getElementById('moverlay').scrollTop=0;}
+function searchTag(t){closeModal();document.getElementById('search-input').value=t;document.getElementById('search-clear').classList.add('visible');curSearch=t;applyFilters();}
+function openSource(){const a=NEWS_DATA[curIdx];if(a&&a.url&&a.url!=='#')window.open(a.url,'_blank');}
+function shareArticle(){const a=NEWS_DATA[curIdx];if(navigator.share){navigator.share({title:a.title,text:a.summary,url:a.url||location.href});}else{navigator.clipboard?.writeText(a.title).then(()=>alert('已複製標題'))}}
+
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape')closeModal();
+  if(document.getElementById('moverlay').classList.contains('open')){
+    if(e.key==='ArrowLeft')navModal(-1);
+    if(e.key==='ArrowRight')navModal(1);
+  }
+});
+
+renderDefault();
+</script>
+</body>
+</html>"""
+
+if __name__ == "__main__":
+    main()
